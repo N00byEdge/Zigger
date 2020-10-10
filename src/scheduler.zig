@@ -5,10 +5,19 @@ const log = @import("logger.zig").log;
 
 const std = @import("std");
 
+fn async_dummy() void {
+  suspend {
+    _ = @frame();
+  }
+}
+
+const frame_align = @alignOf(@Frame(async_dummy));
+
 pub const Task = struct {
-  registers: platform.InterruptFrame,
-  platform_data: platform.TaskData,
+  frame: anyframe->void,
+  frame_bytes: []align(frame_align)u8,
   next_task: ?*Task,
+  wants_to_exit: bool = false,
 };
 
 // A simple lock which can be taken by any execution flow, across task switches.
@@ -97,61 +106,57 @@ const TaskQueue = struct {
 
 pub var queue = TaskQueue{};
 
-fn switch_task(frame: *platform.InterruptFrame, next_task: *Task) void {
+fn switch_task(next_task: *Task) void {
   platform.set_current_task(next_task);
-  frame.* = next_task.registers;
 }
 
-// Yielding from a task
-pub fn yield_handler(frame: *platform.InterruptFrame) void {
-  platform.get_current_task().registers = frame.*;
-  queue.enqueue_task(platform.get_current_task());
-  switch_task(frame, queue.choose_next_task());
-}
+fn task_main(task: *Task, func: anytype, args: anytype) void {
+  suspend;
 
-fn exit_impl() !void {
-  const current_task = try platform.self_exited();
-  try vmm.free_single(current_task);
-}
+  defer exit_task();
 
-// Exiting a task
-pub fn exit_handler(frame: *platform.InterruptFrame) void {
-  exit_impl() catch |err| {
-    log("Could not exit task: {}\n", .{@errorName(err)});
-    while(true) { }
+  _ = @call(.{}, func, args) catch |err| {
+    log("Task exited with error: {}!\n", .{err});
   };
-  switch_task(frame, queue.choose_next_task());
 }
 
-// Starting up a new processor
-pub fn startup_handler(frame: *platform.InterruptFrame) void {
-  const task = vmm.alloc_single(Task) catch |err| {
-    log("Error while allocating task: {}\n", .{@errorName(err)});
-    while(true) { }
-  };
-
-  task.platform_data = platform.TaskData{};
-
-  platform.set_current_task(task);
-}
-
-// Creating a new task from an existing one
+// Creating a new task
 pub fn make_task(func: anytype, args: anytype) !void {
   const task = try vmm.alloc_single(Task);
   errdefer vmm.free_single(task) catch unreachable;
-  try platform.new_task_call(task, func, args);
+
+  const frame_bytes = @alignCast(frame_align, try vmm.alloc_size(u8, @frameSize(task_main)));
+  errdefer vmm.free_size(u8, frame_bytes) catch unreachable;
+
+  task.frame = @asyncCall(frame_bytes, {}, task_main, .{task, func, args});
+
+  queue.enqueue_task(task);
 }
 
 pub fn exit_task() noreturn {
-  platform.exit_task();
+  platform.get_current_task().wants_to_exit = true;
+  suspend;
+  unreachable;
 }
 
 pub fn yield() void {
-  platform.yield();
+  suspend;
 }
 
 pub fn loop() noreturn {
   while(true) {
-    platform.yield();
+    const task = queue.choose_next_task();
+
+    switch_task(task);
+
+    resume task.frame;
+
+    if(task.wants_to_exit) {
+      vmm.free_size(u8, task.frame_bytes) catch unreachable;
+      vmm.free_single(task) catch unreachable;
+    }
+    else {
+      queue.enqueue_task(task);
+    }
   }
 }

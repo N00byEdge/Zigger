@@ -25,9 +25,6 @@ pub fn init_interrupts() !void {
 
   handlers[0x0E] = page_fault_handler;
   handlers[0x69] = startup_handler;
-  handlers[0x6A] = platform.task_fork_handler;
-  handlers[0x6B] = scheduler.yield_handler;
-  handlers[0x6C] = scheduler.exit_handler;
 
   log("Interrupts: Enabling interrupts...\n", .{});
 
@@ -47,8 +44,6 @@ fn type_page_fault(error_code: usize) !platform.PageFaultAccess {
 fn startup_handler(frame: *InterruptFrame) void {
   frame.cs = gdt.selector.code64;
   frame.ss = gdt.selector.data64;
-
-  scheduler.startup_handler(frame);
 }
 
 fn page_fault_handler(frame: *InterruptFrame) void {
